@@ -5,6 +5,11 @@ import sys
 import re
 import cgi
 import markdown
+if hasattr(markdown, 'etree'):
+	etree = markdown.etree
+else:
+	import markdown.util
+	etree = markdown.util.etree
 
 class HabracutPreprocessor(markdown.preprocessors.Preprocessor):
 	RE_CUT = re.compile(r'-[xX]-+(?:\s+(.+))?')
@@ -56,7 +61,7 @@ class SubstituteTreeprocessor(markdown.treeprocessors.Treeprocessor):
 					new_children.append(child)
 
 		if child_was_replaced:
-			new_node = markdown.etree.Element(node.tag)
+			new_node = etree.Element(node.tag)
 			new_node.attrib = node.attrib
 			new_node.extend(new_children)
 			return new_node
@@ -72,10 +77,10 @@ class ImagePostprocessor(SubstituteTreeprocessor):
 				with open('%s.address' % src) as f:
 					thumb_url, page_url = [line.rstrip() for line in f]
 				
-				link = markdown.etree.Element('a')
+				link = etree.Element('a')
 				link.attrib['href'] = page_url
 
-				img = markdown.etree.Element('img')
+				img = etree.Element('img')
 				img.attrib['src'] = thumb_url
 
 				link.append(img)
@@ -92,7 +97,7 @@ class CodeBlockProcessor(SubstituteTreeprocessor):
 
 			m = self.RE.match(text.split('\n')[0])
 
-			elem = markdown.etree.Element('source')
+			elem = etree.Element('source')
 
 			if m:
 				lang = m.group(1)
@@ -107,7 +112,7 @@ class HabrauserPattern(markdown.inlinepatterns.Pattern):
 		markdown.inlinepatterns.Pattern.__init__(self, r'@([a-zA-Z0-9_]+)')
 
 	def handleMatch(self, m):
-		el = markdown.etree.Element('hh')
+		el = etree.Element('hh')
 		el.attrib['user'] = m.group(2)
 		return el
 
