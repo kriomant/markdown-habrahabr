@@ -4,61 +4,9 @@ from __future__ import with_statement
 import sys
 import re
 import cgi
-import subprocess
 import markdown
-import pygments, pygments.formatter, pygments.lexers
 
-# Formats highlighted source into HTML usable on habrahabr,
-# i.e. using only plain "<b>", "<i>" and "<font>" tags.
-class HabraFormatter(pygments.formatter.Formatter):
-	def __init__(self, **options):
-		pygments.formatter.Formatter.__init__(self, **options)
-
-		self.styles = {}
-
-		for ttype, style in self.style:
-			start, end = [], []
-			if style['color']:
-				start.append('<font color="#%s">' % style['color'])
-				end.append('</font>')
-			if style['bold']:
-				start.append('<b>')
-				end.append('</b>')
-			if style['italic']:
-				start.append('<i>')
-				end.append('</i>')
-			if style['underline']:
-				start.append('<u>')
-				end.append('</u>')
-
-			end.reverse()
-			self.styles[ttype] = (''.join(start), ''.join(end))
-
-	def format(self, tokens, out):
-		lasttype = None
-		pending_end = ''
-
-		for ttype, value in tokens:
-			while ttype not in self.styles:
-				ttype = ttype.parent
-
-			if ttype == pygments.token.Text:
-				value = value.replace('\n', '<br/>').replace(' ', '&nbsp;')
-
-			start, end = self.styles[ttype]
-
-			if ttype != lasttype:
-				lasttype = ttype
-				out.write(pending_end)
-				pending_end = end
-				out.write(start)
-
-			out.write(value)
-
-		out.write(pending_end)
-
-
-class HabracutPreprocessor(markdown.Preprocessor):
+class HabracutPreprocessor(markdown.preprocessors.Preprocessor):
 	RE_CUT = re.compile(r'-[xX]-+(?:\s+(.+))?')
 
 	def run(self, lines):
@@ -74,123 +22,106 @@ class HabracutPreprocessor(markdown.Preprocessor):
 		else:
 			return line
 
-class HeaderPostprocessor(markdown.Postprocessor):
+class HeaderPostprocessor(markdown.treeprocessors.Treeprocessor):
 	def run(self, root):
-		self.renameHeaders(root.documentElement)
+		self.renameHeaders(root)
 
-	RENAMES = {'h1': 'h4', 'h2': 'h5', 'h3': 'h6'}
+	RENAMES = {'h1': 'h2', 'h2': 'h3', 'h3': 'h4', 'h4': 'h5', 'h5': 'h6'}
 
 	def renameHeaders(self, node):
-		if node.type == 'element':
-			if node.nodeName in self.RENAMES:
-				node.nodeName = self.RENAMES[node.nodeName]
+		if node.tag in self.RENAMES:
+			node.tag = self.RENAMES[node.tag]
 
-			for child in node.childNodes:
+		for child in node:
 				self.renameHeaders(child)
 
-class ImagePostprocessor(markdown.Postprocessor):
+class SubstituteTreeprocessor(markdown.treeprocessors.Treeprocessor):
 	def run(self, root):
-		self.relocateImages(root.documentElement, root)
+		return self.process_recursively(root)
 
-	def relocateImages(self, node, doc):
-		if node.nodeName == 'img':
-			src = node.attribute_values['src']
+	def process_recursively(self, node):
+		child_was_replaced = False
+		new_children = []
+		for child in node:
+			new_child = self.process(child)
+			if new_child is not None:
+				child_was_replaced = True
+				new_children.append(new_child)
+			else:
+				new_child = self.process_recursively(child)
+				if new_child is not None:
+					child_was_replaced = True
+					new_children.append(new_child)
+				else:
+					new_children.append(child)
+
+		if child_was_replaced:
+			new_node = markdown.etree.Element(node.tag)
+			new_node.attrib = node.attrib
+			new_node.extend(new_children)
+			return new_node
+
+	def process(self, node):
+		raise NotImplemented()
+
+class ImagePostprocessor(SubstituteTreeprocessor):
+	def process(self, node):
+		if node.tag == 'img':
+			src = node.attrib['src']
 			if not src.startswith('http://'):
 				with open('%s.address' % src) as f:
 					thumb_url, page_url = [line.rstrip() for line in f]
-				link = doc.createElement('a')
-				link.setAttribute('href', page_url)
-				node.setAttribute('src', thumb_url)
-				node.parent.replaceChild(node, link)
-				link.appendChild(node)
-		else:
-			for child in node.childNodes:
-				if child.type == 'element':
-					self.relocateImages(child, doc)
+				
+				link = markdown.etree.Element('a')
+				link.attrib['href'] = page_url
 
-class RemoveCodePostprocessor(markdown.Postprocessor):
-	def run(self, root):
-		self.removeCodeFromPre(root.documentElement)
+				img = markdown.etree.Element('img')
+				img.attrib['src'] = thumb_url
 
-	def removeCodeFromPre(self, node):
-		if node.nodeName == 'pre' \
-			and len(node.childNodes) == 1 \
-			and node.childNodes[0].type == 'element' \
-			and node.childNodes[0].nodeName == 'code':
+				link.append(img)
+				return link
 
-			code = node.childNodes[0]
-			for child in code.childNodes:
-				code.removeChild(child)
-				node.appendChild(child)
-			node.removeChild(code)
-
-		else:
-			for child in node.childNodes:
-				if child.type == 'element':
-					self.removeCodeFromPre(child)
-
-class RawNode:
-	def __init__(self, raw_html):
-		self.raw_html = raw_html
-
-	def toxml(self): return self.raw_html
-
-	def handleAttributes(self): pass
-
-class HighlightPostprocessor(markdown.Postprocessor):
-	def run(self, root):
-		self.highlight(root.documentElement)
-
-	RE = re.compile(r'(\\)?@\s*([^\s]+)\s*@')
+class CodeBlockProcessor(SubstituteTreeprocessor):
+	RE = re.compile(r'(?<!\\)@\s*([^\s]+)\s*@')
 	RE_INDENT = re.compile(r'^\s+')
 
-	def highlight(self, node):
-		if node.nodeName == 'pre':
-			text_node = node.childNodes[0]
-			text = text_node.value
+	def process(self, node):
+		if node.tag == 'pre' and len(node) == 1 and node[0].tag == 'code':
+			text = node[0].text
+			lang = "plain"
+
 			m = self.RE.match(text.split('\n')[0])
 
+			elem = markdown.etree.Element('source')
+
 			if m:
-				if not m.group(1):
-					lang = m.group(2)
-					text = '\n'.join(text.split('\n')[1:])
+				lang = m.group(1)
+				text = '\n'.join(text.split('\n')[1:])
 
-					lexer = pygments.lexers.get_lexer_by_name(lang)
-					formatter = HabraFormatter()
-					output = pygments.highlight(text, lexer, formatter)
+			elem.attrib['lang'] = lang
+			elem.text = text
+			return elem
 
-					node.nodeName = 'blockquote'
-					node.replaceChild(text_node, RawNode(output))
-
-				else:
-					text_node.value = text[1:]
-
-		else:
-			for child in node.childNodes:
-				if child.type == 'element':
-					self.highlight(child)
-
-class HabrauserPattern(markdown.Pattern):
+class HabrauserPattern(markdown.inlinepatterns.Pattern):
 	def __init__(self):
-		markdown.Pattern.__init__(self, r'@([a-zA-Z0-9_]+)')
+		markdown.inlinepatterns.Pattern.__init__(self, r'@([a-zA-Z0-9_]+)')
 
-	def handleMatch(self, m, doc):
-		el = doc.createElement('hh')
-		el.setAttribute('user', m.group(2))
+	def handleMatch(self, m):
+		el = markdown.etree.Element('hh')
+		el.attrib['user'] = m.group(2)
 		return el
 
-class StrikePattern(markdown.SimpleTagPattern):
+class StrikePattern(markdown.inlinepatterns.SimpleTagPattern):
 	def __init__(self):
-		markdown.SimpleTagPattern.__init__(self, r'~~([^~]+)~~', 's')
+		markdown.inlinepatterns.SimpleTagPattern.__init__(self, r'(?<!\\)(~~)([^~]+)\2', 's')
 
 md = markdown.Markdown()
-md.preprocessors.append(HabracutPreprocessor())
-md.postprocessors.append(HeaderPostprocessor())
-md.postprocessors.append(ImagePostprocessor())
-md.postprocessors.append(RemoveCodePostprocessor())
-md.postprocessors.append(HighlightPostprocessor())
-md.inlinePatterns.append(HabrauserPattern())
-md.inlinePatterns.append(StrikePattern())
+md.preprocessors['habr-cut'] = HabracutPreprocessor()
+md.treeprocessors['habr-headers'] = HeaderPostprocessor()
+md.treeprocessors['habr-image'] = ImagePostprocessor()
+md.treeprocessors['habr-highlight'] = CodeBlockProcessor()
+md.inlinePatterns['habr-user'] = HabrauserPattern()
+md.inlinePatterns['habr-strike'] = StrikePattern()
 
 text = sys.stdin.read().decode('utf-8')
 html = md.convert(text)
